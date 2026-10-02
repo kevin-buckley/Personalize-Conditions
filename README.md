@@ -11,6 +11,8 @@ CDP/
 ├── Conditions/          # CDP condition templates (JavaScript)
 │   ├── SampleParam.js   # Matches a runtime sampleParam value from the current request
 │   └── ShopWebId.js     # Matches a shopWebId from guest IDENTITY event data
+├── Components/          # Site components the conditions depend on (TypeScript/React)
+│   └── GuestDataCapture.tsx  # Sends the IDENTITY event ShopWebId.js reads
 ├── Middleware/          # Next.js proxy (formerly middleware) extensions (TypeScript)
 │   └── SampleParam.ts   # Extends PersonalizeProxy (Content SDK 2.x) to forward sampleParam and survive null flow answers
 └── README.md
@@ -20,11 +22,63 @@ CDP/
 
 ## Conditions
 
-Condition scripts run inside the Sitecore Personalize execution sandbox. They are pasted into **Sitecore Personalize → Conditions** when creating audience rules for experiences or experiments.
+Condition scripts run inside the Sitecore Personalize execution sandbox. Each one is created once in **Personalize → Conditions**, published, and then used as a column in a decision table (component personalization in Pages) or in an audience for an experience or experiment.
+
+### Creating a condition in Personalize
+
+1. **Personalize → Conditions → Create → Custom.**
+2. **Name** it (e.g. `SampleParam`). The friendly ID is derived from the name (`sampleparam`).
+3. **Paste the script** from `Conditions/` into the code editor, unchanged. It must start with `(function() {` (see [the IIFE rule](#the-script-must-be-an-iife-from-its-first-character)).
+4. **Description**: write a sentence containing the parameter token in double brackets. This is what makes the parameter editable when the condition is used (see below). Use the descriptions in the table.
+5. **Tags** (optional): anything that helps you find it, e.g. `test`.
+6. **Test** (optional): run it against a guest or request, then **Save**.
+7. **Publish** → **Confirm publish**. The status must read **Published**; a Draft condition is never evaluated.
+
+| Condition | Description (copy as is) | Parameter |
+|---|---|---|
+| `SampleParam` | `The url has querystring parameter named sampleParam with value of [[sampleParam]]` | `sampleParam` – the query string value to match, e.g. `123` |
+| `ShopWebId` | `The guest's latest session has an IDENTITY event with shopWebId [[shopWebId]]` | `shopWebId` – the shop/store Web ID to match |
+
+#### How the parameter pop-up works
+
+A token in the script declares the parameter, and a token in the description shows it:
+
+```js
+// in the script: [[name | type | default | { options }]]
+var sampleParamValue = "[[sampleParam | string | | { required: true }]]";
+```
+
+```text
+// in the description: [[name]]  (same name as the script token)
+The url has querystring parameter named sampleParam with value of [[sampleParam]]
+```
+
+When the condition is added as a column in a Pages decision table, the column's **⋯ → Edit parameters** dialog renders the description as a sentence with a text box where `[[sampleParam]]` sits. The value typed there replaces the script token when Personalize runs the flow. If the description has no `[[sampleParam]]` token, there is nowhere to enter the value, and a `required` parameter left empty never matches.
+
+#### The script must be an IIFE from its first character
+
+Personalize refuses to publish a condition with **any** text before `(function() {`, including a header comment, a blank line or a byte-order mark. The publish fails with *"Script is not an IIFE (Immediately Invoked Function Expression)"* (a `400` from `PUT /v3/templates/{id}`, visible only in the browser's network tab), and the condition silently stays in **Draft**. Keep comments inside the function, as both scripts here do.
+
+### Using a condition for component personalization (Pages)
+
+1. Open the page in **Pages → Personalize**, select the component, and choose to personalize it with rules. Pages creates a **decision table** for that component.
+2. **Add column** → pick the published condition (e.g. *SampleParam*).
+3. On the column: **⋯ → Edit parameters**, enter the value (e.g. `123`), **Save**.
+4. **Set the cell, not just the column.** In each rule row click the condition's cell and choose **Is true** → **Confirm**. An empty cell is not a test.
+5. **Save & close.** Each rule row becomes a component variant; configure it in the right panel (e.g. hide the component, swap the datasource).
+6. **Start the personalization.** Select the component again; the right panel shows *Personalized · Draft* with a **Start** button. Until you press it the flow stays `DRAFT` and nothing is served. **Publishing the page does not start it.**
+7. **Publish the page** if the variant changed content or presentation, so Experience Edge has the new variant.
+
+### Verifying it on the site
+
+- Request the page from a real browser (scripted clients such as `curl` can be treated as bots, and the personalize proxy skips bots).
+- Check the `X-Sc-Rewrite` response header. A match rewrites to `…/_variantId_<componentId>_<variantId>`; a non-match rewrites to `…/_variantId_<componentId>_default`. No `_variantId_` segment at all means the proxy did not personalize; check the host's runtime logs (see [Middleware](#middleware-content-sdk-2x-proxy)).
+
+For `SampleParam`, compare `?sampleParam=123` (variant) with `?sampleParam=999` and no parameter (default).
 
 ### `SampleParam.js`
 
-Evaluates the **current request's** `sampleParam` value (passed at runtime via middleware) against a configured value.
+Evaluates the **current request's** `sampleParam` value (forwarded at runtime by the proxy in `Middleware/SampleParam.ts`) against the configured value. Needs that proxy; without it Personalize never sees the value.
 
 | Object Path | Description |
 |---|---|
@@ -33,23 +87,28 @@ Evaluates the **current request's** `sampleParam` value (passed at runtime via m
 
 **Template parameter:** `sampleParam` (string, required) – the value to match against.
 
-### Getting a condition live
-
-- **The script must be an IIFE from its first character.** Personalize refuses to publish a
-  condition with any text before `(function() {`, including a header comment: the publish
-  fails with *"Script is not an IIFE"* and the condition silently stays in **Draft**. Keep
-  comments inside the function.
-- **Publish the condition** in Personalize → Conditions. A Draft condition is never evaluated.
-- **Set the cell, not just the column.** In a Pages decision table the column holds the
-  parameter (e.g. `123`); each rule row still needs *Is true* in that column's cell.
-- **Start the personalization.** In Pages, select the component; the right panel shows
-  *Personalized · Draft* with a **Start** button. Publishing the page does not start it.
-
 ### `ShopWebId.js`
 
 Looks at the **guest's most recent session** for an `IDENTITY` event whose `arbitraryData.ext.shopWebId` matches the configured value. This targets visitors by their associated shop/store.
 
 **Template parameter:** `shopWebId` (string, required) – the store Web ID to match.
+
+Unlike `SampleParam`, this reads **stored guest data**, not the current request, so it needs something on the site that sends the `IDENTITY` event. `Components/GuestDataCapture.tsx` does that: on a URL with `?webid=<value>` it sends an `IDENTITY` event with `extensionData: { shopWebId: <value> }` through `@sitecore-content-sdk/events`.
+
+1. Copy `Components/GuestDataCapture.tsx` into the starter (e.g. `src/components/content-sdk/`).
+2. Render it once in the layout, inside the SDK `<Providers>` (the Events SDK must be initialized) and inside a `<Suspense>` boundary, because it uses `useSearchParams`. The article starter does this in `src/Layout.tsx`:
+
+   ```tsx
+   <Providers page={page} localizedPaths={localizedPaths}>
+     <Suspense fallback={null}>
+       <GuestDataCapture />
+     </Suspense>
+     {/* ...page content */}
+   </Providers>
+   ```
+3. Visit a page with `?webid=12345`, then load a page personalized on `ShopWebId` with the value `12345`. Because the event is stored first and the condition reads it on a later request, the variant shows from the **next** page load, not the one that carried `?webid=`.
+
+The component is skipped under `next dev` (the Events SDK is not initialized there), so test on a deployed build.
 
 ---
 
