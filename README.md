@@ -33,6 +33,18 @@ Evaluates the **current request's** `sampleParam` value (passed at runtime via m
 
 **Template parameter:** `sampleParam` (string, required) – the value to match against.
 
+### Getting a condition live
+
+- **The script must be an IIFE from its first character.** Personalize refuses to publish a
+  condition with any text before `(function() {`, including a header comment: the publish
+  fails with *"Script is not an IIFE"* and the condition silently stays in **Draft**. Keep
+  comments inside the function.
+- **Publish the condition** in Personalize → Conditions. A Draft condition is never evaluated.
+- **Set the cell, not just the column.** In a Pages decision table the column holds the
+  parameter (e.g. `123`); each rule row still needs *Is true* in that column's cell.
+- **Start the personalization.** In Pages, select the component; the right panel shows
+  *Personalized · Draft* with a **Start** button. Publishing the page does not start it.
+
 ### `ShopWebId.js`
 
 Looks at the **guest's most recent session** for an `IDENTITY` event whose `arbitraryData.ext.shopWebId` matches the configured value. This targets visitors by their associated shop/store.
