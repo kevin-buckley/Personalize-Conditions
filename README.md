@@ -11,8 +11,8 @@ CDP/
 ├── Conditions/          # CDP condition templates (JavaScript)
 │   ├── SampleParam.js   # Matches a runtime sampleParam value from the current request
 │   └── ShopWebId.js     # Matches a shopWebId from guest IDENTITY event data
-├── Middleware/           # Next.js middleware extensions (TypeScript)
-│   └── SampleParam.ts   # Extends PersonalizeMiddleware to forward sampleParam to CDP
+├── Middleware/          # Next.js proxy (formerly middleware) extensions (TypeScript)
+│   └── SampleParam.ts   # Extends PersonalizeProxy (Content SDK 2.x) to forward sampleParam and survive null flow answers
 └── README.md
 ```
 
@@ -53,59 +53,49 @@ Looks at the **guest's most recent session** for an `IDENTITY` event whose `arbi
 
 ---
 
-## Middleware
+## Middleware (Content SDK 2.x proxy)
 
-The middleware extension lives in `Middleware/SampleParam.ts`. It extends the Sitecore Content SDK's `PersonalizeMiddleware` so that the `sampleParam` query string value is forwarded to CDP as an experience parameter on every personalization request.
+The extension lives in `Middleware/SampleParam.ts`. It extends the Sitecore Content SDK's `PersonalizeProxy` (Next.js 16 proxy, formerly `PersonalizeMiddleware`) so that:
 
-### Wiring Up the Middleware
+- the `sampleParam` query string value is forwarded to Personalize as an experience parameter on every personalization request, and
+- a `null` answer from Personalize for one flow no longer throws away every other variant on the page (see below).
 
-The middleware must be integrated into a Next.js XM Cloud starter's `src/middleware.ts`. Here is a step-by-step guide using the article starter as a reference.
+### Why the `personalize()` override matters
 
-#### 1. Copy the middleware class into your starter
+Edge can list variants for a page whose flow no longer exists in Personalize, for example page-level variants left behind after the page switched to component personalization. Personalize answers `null` for those. Content SDK 2.4 reads `.variantId` off that null inside one `Promise.all`, so the whole proxy fails and every visitor gets the default variant. The symptom in the host's runtime logs is:
 
-Copy `Middleware/SampleParam.ts` into your Next.js project, or reference the class directly. In the article starter the class is defined inline in `src/middleware.ts`:
+```
+Personalize proxy failed:
+TypeError: Cannot read properties of null (reading 'variantId')
+```
+
+with no `_variantId_` segment in the `X-Sc-Rewrite` response header. The override treats a null answer as "no variant for that flow".
+
+### Wiring it up
+
+The article starter (`xmcloud-starter-js/examples/kit-nextjs-article-starter/src/proxy.ts`) defines the class inline; copying `Middleware/SampleParam.ts` into your starter works the same way.
+
+#### 1. Import the class and the SDK proxies
 
 ```typescript
-// src/middleware.ts
+// src/proxy.ts
 import { type NextRequest, type NextFetchEvent } from 'next/server';
 import {
-  defineMiddleware,
-  AppRouterMultisiteMiddleware,
-  PersonalizeMiddleware,
-  RedirectsMiddleware,
-  LocaleMiddleware,
-} from '@sitecore-content-sdk/nextjs/middleware';
-import type { ExperienceParams } from '@sitecore-content-sdk/nextjs/types/middleware/personalize-middleware';
+  defineProxy,
+  AppRouterMultisiteProxy,
+  RedirectsProxy,
+  LocaleProxy,
+} from '@sitecore-content-sdk/nextjs/proxy';
 import sites from '.sitecore/sites.json';
 import scConfig from 'sitecore.config';
 import { routing } from './i18n/routing';
+import { SampleParamPersonalizeProxy } from './SampleParam'; // wherever you copied Middleware/SampleParam.ts
 ```
 
-#### 2. Define the extended middleware class
+#### 2. Instantiate it in place of `PersonalizeProxy`
 
 ```typescript
-type ExtendedExperienceParams = ExperienceParams & { sampleParam?: string };
-
-class SampleParamPersonalizeMiddleware extends PersonalizeMiddleware {
-  protected getExperienceParams(req: NextRequest): ExperienceParams {
-    const params = super.getExperienceParams(req) as ExtendedExperienceParams;
-
-    const sampleValue =
-      req.nextUrl.searchParams.get('sampleParam') || undefined;
-
-    if (sampleValue) {
-      params.sampleParam = sampleValue;
-    }
-
-    return params;
-  }
-}
-```
-
-#### 3. Instantiate the personalize middleware
-
-```typescript
-const personalize = new SampleParamPersonalizeMiddleware({
+const personalize = new SampleParamPersonalizeProxy({
   sites,
   ...scConfig.api.edge,
   ...scConfig.personalize,
@@ -113,33 +103,36 @@ const personalize = new SampleParamPersonalizeMiddleware({
 });
 ```
 
-#### 4. Register it in the middleware chain
+#### 3. Register it last in the proxy chain
 
 ```typescript
-export function middleware(req: NextRequest, ev: NextFetchEvent) {
-  return defineMiddleware(locale, multisite, redirects, personalize).exec(req, ev);
+export default function proxy(req: NextRequest, event: NextFetchEvent) {
+  // locale, multisite and redirects constructed as in the starter
+  return defineProxy(locale, multisite, redirects, personalize).exec(req);
 }
 ```
 
-The order matters — `personalize` should be last so that locale, multisite, and redirect resolution happen first.
+Order matters: `personalize` goes last so locale, multisite and redirect resolution happen first.
 
-#### 5. Set environment variables
+#### 4. Environment variables
 
-Add these to your `.env.local` (values from XM Cloud Portal → Environment → Developer Settings):
+Personalize uses the Edge context ID the starter already has (`SITECORE_EDGE_CONTEXT_ID`); without it the proxy disables itself. Optional tuning, from the starter's `.env.remote.example`:
 
 ```bash
 NEXT_PUBLIC_PERSONALIZE_SCOPE=           # Optional scope to isolate personalization data
-PERSONALIZE_MIDDLEWARE_CDP_TIMEOUT=       # CDP API timeout in ms (optional)
-PERSONALIZE_MIDDLEWARE_EDGE_TIMEOUT=      # Edge API timeout in ms (optional)
+PERSONALIZE_PROXY_CDP_TIMEOUT=           # Personalize API timeout in ms (optional)
+PERSONALIZE_PROXY_EDGE_TIMEOUT=          # Edge API timeout in ms (optional)
 ```
 
 ### How It Works End-to-End
 
 1. A visitor navigates to `https://yoursite.com/page?sampleParam=test123`.
-2. Next.js Edge Middleware runs; `SampleParamPersonalizeMiddleware.getExperienceParams()` extracts `test123` from the query string.
-3. The SDK sends the experience params (including `sampleParam: "test123"`) to the Sitecore Personalize API.
-4. In CDP, the **SampleParam condition** (`Conditions/SampleParam.js`) evaluates `request.params.utm.sampleParam` against the configured value.
-5. If the condition matches, the visitor sees the personalized variant.
+2. The Next.js proxy runs; `SampleParamPersonalizeProxy.getExperienceParams()` extracts `test123` from the query string.
+3. The SDK sends the experience params (including `sampleParam: "test123"`) to the Sitecore Personalize API for each flow on the page.
+4. In Personalize, the **SampleParam condition** (`Conditions/SampleParam.js`) compares the value against the configured one.
+5. If it matches, the proxy rewrites to the variant (`/_variantId_<componentId>_<variantId>`) and the visitor sees it.
+
+Test from a real browser, not `curl`: the bot-tracking proxy can mark scripted clients as bots, and the personalize proxy skips bots.
 
 ---
 
@@ -147,7 +140,7 @@ PERSONALIZE_MIDDLEWARE_EDGE_TIMEOUT=      # Edge API timeout in ms (optional)
 
 To add another custom query parameter (e.g., `campaignId`):
 
-1. **Middleware** – In `getExperienceParams`, read `req.nextUrl.searchParams.get('campaignId')` and assign it to `params.campaignId`.
+1. **Proxy** – In `getExperienceParams`, read `req.nextUrl.searchParams.get('campaignId')` and assign it to `params.campaignId`.
 2. **Condition** – Create a new JS condition in `Conditions/` that checks `request.params.utm.campaignId` (or `request.params.campaignId`).
 3. **CDP** – Create the condition template in Sitecore Personalize and apply it to your experience.
 
@@ -155,6 +148,6 @@ To add another custom query parameter (e.g., `campaignId`):
 
 ## References
 
-- [Sitecore Content SDK Middleware Docs](https://doc.sitecore.com/xmc/en/developers/content-sdk/the-sitecore-configuration-file.html)
+- [Sitecore Content SDK configuration file](https://doc.sitecore.com/xmc/en/developers/content-sdk/the-sitecore-configuration-file.html)
 - [Sitecore Personalize Conditions](https://doc.sitecore.com/personalize/en/developers/api/index-en.html)
-- Article starter middleware: `xmcloud-starter-js/examples/kit-nextjs-article-starter/src/middleware.ts`
+- Article starter proxy: `xmcloud-starter-js/examples/kit-nextjs-article-starter/src/proxy.ts`
